@@ -1,0 +1,30 @@
+name: Verify sharded database
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: go test ./...
+      - run: go vet ./...
+      - run: python -m unittest discover -s tools -p test_*.py
+      - run: go build -o sharded.exe ./cmd/sharded
+      - run: python tools/verify.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: database-fault-evidence
+          path: |
+            evidence/**/events.json
+            evidence/**/history.json
+            evidence/**/result.json
+            evidence/**/*.log
