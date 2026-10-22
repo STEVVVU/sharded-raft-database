@@ -18,4 +18,6 @@ JSON invocation/return histories, assertions, retained cleanup-donor snapshots a
 Every journey initializes `result.json` with `passed: false`. It records any exception and finalizes the verdict only after owned cleanup, including process and proxy-thread status. `python tools/verify.py --fail-after-doctor` deliberately raises after all nine nodes become ready. Expect exit 1, retained error, `passed: false`, and both cleanup status fields true. This is a verification-only failure flag; it changes no product behavior. CI checks this path before the normal journey. Historical evidence is never retroactively rewritten.
 
 ## Cleanup
+
+The [benchmark path](features/benchmark.md) uses `tools/benchmark.py` plus `tools/benchmark_support.py`. Start with smoke before isolated Linux benchmark/profile. It retains exact real-result proof, all outcomes and owned cleanup. Existing correctness history checks remain authoritative for their bounded scope.
 The driver terminates and waits only for PIDs it created in a finally block. It releases its response barrier, closes its proxy server, and joins its owned server thread. Evidence survives cleanup. State remains under the run folder for inspection.

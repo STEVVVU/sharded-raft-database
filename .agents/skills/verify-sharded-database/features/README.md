@@ -3,6 +3,7 @@
 - [Replicated key operations](kv.md).
 - [Shard migration](migration.md).
 - [Crash and snapshot recovery](recovery.md).
+- [Frozen read/write load and migration benchmark](benchmark.md).
 
 ## Sub-features
 Replicated Get/Put/Append, durable duplicate suppression, fenced shard migration, controller recovery, quorum failure, snapshots and restart.

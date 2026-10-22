@@ -1,5 +1,7 @@
 # Sharded Raft key/value database
 
+The [frozen benchmark](.agents/skills/verify-sharded-database/features/benchmark.md) drives nine real HTTP/Raft nodes. `python tools/benchmark.py smoke` checks exact committed results/readbacks. `benchmark` measures five-repeat read/write/data/concurrency cells, offered-load/stability and migration/leader loss on isolated Linux. `profile` captures separate generator/runtime diagnostics. Ignored `evidence/benchmark-*/` retains outcomes, uncertainty, latency, migration and CPU/RSS. No measured performance result is published yet. Native hot-path CPU profiling and replication-index telemetry remain unmeasured; shard count remains fixed at four.
+
 A bounded teaching database with two data groups and a replicated configuration controller. Each group runs three independent processes. Every node has its own TCP Raft transport, durable Bolt log, stable state, and file snapshots. New code lives in `sharddb` and `cmd/sharded`.
 
 This is an independently implemented, course-inspired project. It contains no MIT lab skeleton, grader, or student solution. It does not claim MIT assignment completion. The design follows the mechanisms described in the [2026 sharded-service requirements](https://pdos.csail.mit.edu/6.824/labs/lab-shard1.html) and the [Raft paper](https://raft.github.io/raft.pdf). Exact MIT lab code remains subject to its [course publication policy](https://pdos.csail.mit.edu/6.824/general.html).

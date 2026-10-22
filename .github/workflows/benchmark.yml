@@ -1,0 +1,46 @@
+name: Database benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        description: Isolated benchmark or separate diagnostic profile
+        options: [benchmark, profile]
+        default: benchmark
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: local
+      CGO_ENABLED: 0
+      GOMAXPROCS: 2
+      GOMEMLIMIT: 384MiB
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.3'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: go build -o sharded.exe ./cmd/sharded
+      - run: python -m unittest discover -s tools -p test_*.py -v
+      - run: python tools/benchmark.py smoke
+      - run: python tools/benchmark.py ${{ inputs.mode }}
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: database-benchmark-${{ inputs.mode }}-${{ github.sha }}
+          path: |
+            evidence/benchmark-*/summary.json
+            evidence/benchmark-*/*.pstats
+            evidence/benchmark-*/trial-*/result.json
+            evidence/benchmark-*/trial-*/resources.json
+            evidence/benchmark-*/trial-*/*.log
+          retention-days: 14
+
