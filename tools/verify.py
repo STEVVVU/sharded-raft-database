@@ -20,6 +20,8 @@ def freeport():
 def baseline():
     run = ROOT/'evidence'/('baseline-'+str(time.time_ns()))
     run.mkdir(parents=True)
+    result={'passed':False};completed=False
+    (run/'result.json').write_text(json.dumps(result,indent=2))
     port, raft = freeport(), freeport()
     log = (run/'node.log').open('wb')
     p = subprocess.Popen([str(ROOT/'baseline.exe'), '-haddr', f'127.0.0.1:{port}', '-raddr',f'127.0.0.1:{raft}',str(run/'state')],stdout=log,stderr=log)
@@ -32,13 +34,24 @@ def baseline():
                 with urllib.request.urlopen(f'http://127.0.0.1:{port}/key/baseline') as r:
                     value=json.load(r)
                 assert value=={'baseline':'verified'},value
-                (run/'result.json').write_text(json.dumps({'passed':True,'value':value,'pid':p.pid}))
+                result.update(value=value,pid=p.pid);completed=True
                 break
             except Exception:
                 if time.monotonic()>deadline: raise
                 time.sleep(.1)
+    except BaseException as error:
+        result['error']={'type':type(error).__name__,'message':str(error)}
+        raise
     finally:
-        p.terminate(); p.wait(timeout=10); log.close()
+        try:
+            p.terminate();p.wait(timeout=10);log.close()
+        except BaseException as error:
+            result['cleanup_error']={'type':type(error).__name__,'message':str(error)}
+            raise
+        finally:
+            result['cleanup']={'all_owned_processes_stopped':p.poll() is not None}
+            result['passed']=completed and result['cleanup']['all_owned_processes_stopped'] and 'cleanup_error' not in result
+            (run/'result.json').write_text(json.dumps(result,indent=2))
     assert (run/'result.json').exists()
     print(run)
 
@@ -71,8 +84,10 @@ def check_history(history):
         assert search(set(),''),'nonlinearizable history for '+key
     return len(collapsed)
 
-def journey():
+def journey(fail_after_doctor=False):
     run=ROOT/'evidence'/('journey-'+str(time.time_ns()));run.mkdir(parents=True)
+    result={'passed':False,'nodes':9,'cleanup':{'all_owned_processes_stopped':False,'proxy_threads_stopped':False}}
+    (run/'result.json').write_text(json.dumps(result,indent=2))
     config={'Token':os.urandom(24).hex(),'Nodes':[]}
     reserved=[]
     for group in ['controller','a','b']:
@@ -85,13 +100,8 @@ def journey():
     configpath=run/'cluster.json';configpath.write_text(json.dumps(config))
     for s in reserved:s.close()
     processes={};handles=[];history=[];events=[]
+    proxies=[];completed=False
     client=Client(config,'oracle',history.append)
-    proxy=CleanupReplyProxy(client,freeport())
-    proxies=[proxy]+[CleanupReplyProxy(client,freeport(),barrier=proxy) for _ in range(2)]
-    controller_config=json.loads(json.dumps(config))
-    for node,forwarder in zip(controller_config['Nodes'][3:6],proxies):
-        node['HTTP']='127.0.0.1:'+str(forwarder.server.server_address[1])
-    controller_path=run/'controller-cluster.json';controller_path.write_text(json.dumps(controller_config))
     def event(name,**data):
         events.append({'event':name,'at':time.monotonic_ns(),**data})
         (run/'events.json').write_text(json.dumps(events,indent=2))
@@ -126,11 +136,18 @@ def journey():
         event('migration_stalled',state=state)
         raise AssertionError('migration did not finish')
     try:
+        proxy=CleanupReplyProxy(client,freeport());proxies.append(proxy)
+        for _ in range(2):proxies.append(CleanupReplyProxy(client,freeport(),barrier=proxy))
+        controller_config=json.loads(json.dumps(config))
+        for node,forwarder in zip(controller_config['Nodes'][3:6],proxies):
+            node['HTTP']='127.0.0.1:'+str(forwarder.server.server_address[1])
+        controller_path=run/'controller-cluster.json';controller_path.write_text(json.dumps(controller_config))
         for node in config['Nodes']:start(node)
         for group in ['controller','a','b']:leader(group)
         client.group('controller','/config',{})
         assert all(p.poll() is None for p in processes.values())
         event('doctor',nodes=9)
+        if fail_after_doctor:raise RuntimeError('controlled verification failure after doctor')
         keys={}
         for i in range(100):keys.setdefault(shard('key'+str(i)),'key'+str(i))
         for key in keys.values():assert client.op('put',key,'seed')=='seed'
@@ -218,19 +235,43 @@ def journey():
         assert uncertain.op('append',key,'Q',identity=1)=='seedQ'
         for key in keys.values():client.op('get',key)
         count=check_history(history);event('bounded_linearizability_pass',logical_operations=count)
-        (run/'result.json').write_text(json.dumps({'passed':True,'logical_operations':count,'nodes':9,'scope':'per-key bounded completed history with retries collapsed'},indent=2))
+        result.update(logical_operations=count,scope='per-key bounded completed history with retries collapsed')
+        completed=True
+    except BaseException as error:
+        result['error']={'type':type(error).__name__,'message':str(error)}
+        raise
     finally:
-        (run/'history.json').write_text(json.dumps(history,indent=2))
+        cleanup_errors=[]
         for p in processes.values():
-            if p.poll() is None:p.terminate()
-        for p in processes.values():p.wait(timeout=10)
-        for h in handles:h.close()
-        for forwarder in proxies:forwarder.close()
-        event('cleanup',all_owned_processes_stopped=all(p.poll() is not None for p in processes.values()))
-    assert (run/'result.json').exists();print(run)
+            try:
+                if p.poll() is None:p.terminate()
+            except OSError as error:cleanup_errors.append(f'PID {p.pid}: {error}')
+        for p in processes.values():
+            try:
+                try:p.wait(timeout=10)
+                except subprocess.TimeoutExpired:p.kill();p.wait(timeout=10)
+            except (OSError,subprocess.TimeoutExpired) as error:cleanup_errors.append(f'PID {p.pid}: {error}')
+        for h in handles:
+            try:h.close()
+            except OSError as error:cleanup_errors.append(str(error))
+        for forwarder in proxies:
+            try:forwarder.close()
+            except Exception as error:cleanup_errors.append(str(error))
+        cleanup={'all_owned_processes_stopped':all(p.poll() is not None for p in processes.values()),
+                 'proxy_threads_stopped':all(not p.thread.is_alive() for p in proxies),'errors':cleanup_errors}
+        result['cleanup']=cleanup
+        result['passed']=completed and cleanup['all_owned_processes_stopped'] and cleanup['proxy_threads_stopped'] and not cleanup_errors
+        if not result['passed'] and 'error' not in result:
+            result['error']={'type':'CleanupError','message':'owned cleanup did not complete successfully'}
+        (run/'history.json').write_text(json.dumps(history,indent=2))
+        event('cleanup',**cleanup)
+        (run/'result.json').write_text(json.dumps(result,indent=2))
+        print(run)
+        if completed and not result['passed']:raise RuntimeError(result['error']['message'])
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(); parser.add_argument('--baseline',action='store_true')
+    parser.add_argument('--fail-after-doctor',action='store_true',help='verification-only controlled failure after all nine processes are ready')
     args=parser.parse_args()
     if args.baseline: baseline()
-    else: journey()
+    else: journey(fail_after_doctor=args.fail_after_doctor)

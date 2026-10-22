@@ -1,5 +1,9 @@
 # Local implementation evidence
 
+The current driver verdict evidence is `evidence/journey-1792633010718233200`, which passes all 37 logical operations and reports successful process and proxy cleanup in its finalized result. A controlled failure is retained at `evidence/journey-1792633075169719800`. `python tools/verify.py --fail-after-doctor` exits 1 with the original RuntimeError, `passed: false`, stopped owned processes and proxy threads, and no cleanup errors. The exact CI failure-verdict assertions were executed locally and passed. The baseline was also rerun at `evidence/baseline-1792633053384438600`, with success finalized after its owned process stopped.
+
+The prior driver wrote success before cleanup and did not write a result on failure. Its historical red journey `journey-1792632535071971900` therefore has events and history but no result.json. That folder remains unchanged. New journeys initialize a false verdict, retain errors, and finalize only after actual cleanup. Cleanup failures cannot retain `passed: true`, and the original failure still exits nonzero. CI now exercises the controlled failure path before the normal journey.
+
 Upstream base `97a01648bd9e2dfc4c95c3c25a3621dd8d153adb` was cloned with its complete history on 2026-10-21. The extension preserves the original store, HTTP package, executable, license, and upstream README.
 
 The first baseline result is retained in `evidence/baseline-1792631500266386700`. It records an actual original executable HTTP write/read and owned-process cleanup. The initial sharded process journey is retained in `evidence/journey-1792631689482692300`. Later journeys add overlapping readers and two writers and correct the competing-intent fixture to require the specific `migration busy` error.

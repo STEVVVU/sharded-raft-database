@@ -18,6 +18,20 @@ jobs:
       - run: go vet ./...
       - run: python -m unittest discover -s tools -p test_*.py
       - run: go build -o sharded.exe ./cmd/sharded
+      - name: Verify failed verdict and owned cleanup
+        shell: python
+        run: |
+          import json, pathlib, subprocess, sys
+          root = pathlib.Path('evidence')
+          before = set(root.glob('journey-*'))
+          completed = subprocess.run([sys.executable, 'tools/verify.py', '--fail-after-doctor'])
+          assert completed.returncode == 1
+          created = set(root.glob('journey-*')) - before
+          assert len(created) == 1
+          result = json.loads((created.pop() / 'result.json').read_text())
+          assert result['passed'] is False
+          assert result['error']['message'] == 'controlled verification failure after doctor'
+          assert result['cleanup'] == {'all_owned_processes_stopped': True, 'proxy_threads_stopped': True, 'errors': []}
       - run: python tools/verify.py
       - uses: actions/upload-artifact@v6
         if: always()
