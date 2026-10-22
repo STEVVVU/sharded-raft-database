@@ -1,6 +1,4 @@
 """Bounded benchmark evidence for real product drivers; no simulated work."""
-import concurrent.futures
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,14 +10,6 @@ import threading
 import time
 
 
-def quantiles(values):
-    import math
-    if not values:
-        return None
-    data = sorted(values)
-    return dict(count=len(data), min=data[0], p50=data[math.ceil(.5*len(data))-1], p95=data[math.ceil(.95*len(data))-1], p99=data[math.ceil(.99*len(data))-1], max=data[-1])
-
-
 def save(path, value):
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(value, indent=2))
@@ -27,7 +17,11 @@ def save(path, value):
 
 
 def environment(root):
-    return dict(source=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(), dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=root, text=True).strip()), python=platform.python_version(), platform=platform.platform(), cores=os.cpu_count(), clock_ticks=os.sysconf('SC_CLK_TCK') if os.name != 'nt' else None)
+    info=dict(source=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(), dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=root, text=True).strip()), python=platform.python_version(), platform=platform.platform(), cores=os.cpu_count(), clock_ticks=os.sysconf('SC_CLK_TCK') if os.name != 'nt' else None)
+    if os.name != 'nt':
+        info['cpu_model']=next((line.split(':',1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')),None)
+        info['ram_bytes']=next((int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:')),None)
+    return info
 
 
 class Run:
@@ -92,39 +86,4 @@ class Run:
             log.close()
         save(self.path / 'resources.json', self.resources)
         return dict(all_exited=all(p.poll() is not None for _, p in self.processes), sampler_stopped=not self.thread.is_alive(), errors=errors)
-
-
-def load(action, count, concurrency, rate=None):
-    """Start latency at intended arrival; record every offer, including generator declines."""
-    start = time.perf_counter()
-    samples, pending = [], set()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        for index in range(count):
-            scheduled = start + index/rate if rate else time.perf_counter()
-            if rate:
-                time.sleep(max(0, scheduled-time.perf_counter()))
-            pending = {future for future in pending if not future.done()}
-            sample = dict(index=index, scheduled=scheduled)
-            samples.append(sample)
-            if rate and len(pending) >= concurrency:
-                sample['outcome'] = 'generator_declined'
-                continue
-            def one(item=sample):
-                item['started'] = time.perf_counter()
-                try:
-                    item['proof'] = action(item['index'])
-                    item['outcome'] = 'finished'
-                except TimeoutError as error:
-                    item.update(outcome='timed_out', error=repr(error))
-                except Exception as error:
-                    code = getattr(error, 'code', None)
-                    item.update(outcome='rejected' if isinstance(code, int) and 400 <= code < 500 else 'failed', error=repr(error))
-                item['finished'] = time.perf_counter()
-                item['latency_ms'] = 1000*(item['finished']-item['scheduled'])
-                item['dispatch_lag_ms'] = 1000*(item['started']-item['scheduled'])
-            pending.add(pool.submit(one))
-    end = time.perf_counter()
-    outcomes = {name: sum(s['outcome'] == name for s in samples) for name in ['finished', 'failed', 'rejected', 'timed_out', 'generator_declined']}
-    assert sum(outcomes.values()) == count
-    return dict(offered=count, **outcomes, samples=samples, start=start, end=end, elapsed_seconds=end-start, throughput=outcomes['finished']/(end-start), latency_ms=quantiles([s['latency_ms'] for s in samples if s['outcome'] == 'finished']), dispatch_lag_ms=quantiles([s['dispatch_lag_ms'] for s in samples if 'started' in s]))
 

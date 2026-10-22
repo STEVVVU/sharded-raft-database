@@ -19,5 +19,5 @@ Every journey initializes `result.json` with `passed: false`. It records any exc
 
 ## Cleanup
 
-The [benchmark path](features/benchmark.md) uses `tools/benchmark.py` plus `tools/benchmark_support.py`. Start with smoke before isolated Linux benchmark/profile. It retains exact real-result proof, all outcomes and owned cleanup. Existing correctness history checks remain authoritative for their bounded scope.
+The [version-2 benchmark path](features/benchmark.md) reuses `tools/benchmark.py` for ownership and `tools/benchmark-k6.js` for native k6 v2.3.0 load/statistics. The hosted workflow pins that tool, drives this existing process verifier, then gates metric smoke before comparisons/faults. This framework integration remains a draft until an actual nine-node k6 smoke is observed. Its pure controls pass; no local native run is claimed. Existing correctness history checks remain authoritative for their bounded scope.
 The driver terminates and waits only for PIDs it created in a finally block. It releases its response barrier, closes its proxy server, and joins its owned server thread. Evidence survives cleanup. State remains under the run folder for inspection.
