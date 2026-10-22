@@ -38,7 +38,12 @@ def outcomes(summary,planned):
     errors={name:metric(summary,'transaction_'+name) for name in ['failed','rejected','uncertain']}
     dropped=metric(summary,'dropped_iterations')
     unresolved=started-finished-sum(errors.values())
-    return dict(planned_offers=planned,started=started,finished=finished,**errors,dropped_iterations=dropped,unresolved_started=unresolved,not_started=max(0,planned-started-dropped),extra_started=max(0,started+dropped-planned))
+    return dict(planned_offers=planned,native_scheduled_offers=started+dropped,boundary_offer_delta=started+dropped-planned,started=started,finished=finished,**errors,dropped_iterations=dropped,unresolved_started=unresolved,not_started=max(0,planned-started-dropped),extra_started=max(0,started+dropped-planned))
+
+
+def complete_native_load(counts):
+    # Pinned k6 v2.3.0 can select its final timer before duration cancellation.
+    return counts['native_scheduled_offers'] in {counts['planned_offers'],counts['planned_offers']+1} and counts['started']>0 and counts['finished']==counts['started'] and not any(counts[name] for name in ['failed','rejected','uncertain','dropped_iterations','unresolved_started','not_started'])
 
 
 def receipts(path):
@@ -139,6 +144,7 @@ def trial(path,cell,rate=25,seconds=10,fault=None,profile=False,k6='k6'):
         assert not result.get('observer_error'),result.get('observer_error')
         data=json.loads(native.read_text())
         result['outcomes']=outcomes(data,rate*seconds)
+        result['native_offer_scope']='Requested rate-duration target and actual native scheduled offers are separate; only the pinned k6 v2.3.0 zero-or-one final-boundary difference is permitted. Every native start must finish; drops/deficits/errors remain failures.'
         result['native_summary']='k6-summary.json'
         ledger=receipts(console);result['receipt_operations_returned']=ledger['returned_operations'];result['pending_operations']=ledger['pending']
         if fault:
@@ -173,7 +179,7 @@ def trial(path,cell,rate=25,seconds=10,fault=None,profile=False,k6='k6'):
         result['after']={node['ID']:control.call(node,'/status') for node in config['Nodes']}
         counts=result['outcomes']
         result['correctness_passed']=not ledger['pending'] and counts['started']>0 and counts['unresolved_started']==0 and not any(counts[name] for name in ['failed','rejected','uncertain']) and counts['finished']==counts['started'] and metric(data,'checks','rate',None)==1
-        result['passed']=result['k6_exit_code'] in [0,99] and result['correctness_passed'] and counts['finished']==rate*seconds and counts['dropped_iterations']==0 and counts['extra_started']==0
+        result['passed']=result['k6_exit_code'] in [0,99] and result['correctness_passed'] and complete_native_load(counts)
         tails=[metric(data,'group_duration{group:::'+kind+'}','p(99)',None) for kind in (['get'] if cell['reads_percent']==100 else ['put_get'] if cell['reads_percent']==0 else ['get','put_get'])]
         result['load_slo_passed']=result['passed'] and all(tail is not None and tail<5000 for tail in tails)
         if profile:result['profile_scope']='Existing Go scheduler/GC traces only; native hot-path CPU profile remains unavailable. k6 owns load/statistics.'

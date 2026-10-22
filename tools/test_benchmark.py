@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from benchmark import cells,value,outcomes,receipts,WORKLOAD
+from benchmark import cells,value,outcomes,receipts,WORKLOAD,complete_native_load
 from client import shard
 
 
@@ -30,6 +30,27 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result['not_started'],2)
         self.assertEqual(result['dropped_iterations'],2)
         self.assertEqual(result['planned_offers'],result['started']+result['dropped_iterations']+result['not_started'])
+
+    def test_pinned_native_boundary_retains_actual_51_and_251_offers(self):
+        for planned,actual in [(50,51),(250,251),(250,250)]:
+            with self.subTest(planned=planned,actual=actual):
+                native=dict(metrics={name:dict(values=dict(count=actual)) for name in ['transaction_started','transaction_finished']})
+                counts=outcomes(native,planned)
+                self.assertEqual(counts['native_scheduled_offers'],actual)
+                self.assertEqual(counts['planned_offers'],planned)
+                self.assertEqual(counts['boundary_offer_delta'],actual-planned)
+                self.assertTrue(complete_native_load(counts))
+
+    def test_boundary_exception_does_not_hide_drops_missing_extra_or_unfinished_work(self):
+        for name,started,finished,dropped,failed in [
+            ('dropped',250,250,1,0),('missing',249,249,0,0),
+            ('plus_two',252,252,0,0),('unresolved',251,250,0,0),
+            ('failed',251,250,0,1),('rejected',251,250,0,1),('uncertain',251,250,0,1)]:
+            with self.subTest(name=name):
+                native=dict(metrics={key:dict(values=dict(count=count)) for key,count in {
+                    'transaction_started':started,'transaction_finished':finished,
+                    'dropped_iterations':dropped,'transaction_'+(name if name in ['failed','rejected','uncertain'] else 'failed'):failed}.items()})
+                self.assertFalse(complete_native_load(outcomes(native,250)))
 
     def test_native_receipts_keep_pending_identity_and_latest_acknowledged_value(self):
         first=dict(version=2,client='seed-v2',seq=1,op='put',key='write-0',input='old',invoke=1)
