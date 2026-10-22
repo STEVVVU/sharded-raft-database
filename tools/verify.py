@@ -1,6 +1,7 @@
 """Real-process verifier. All process handles and evidence belong to this run."""
 import argparse, concurrent.futures, json, os, pathlib, socket, subprocess, time, urllib.request
 from client import Client, shard
+from fault_proxy import CleanupReplyProxy
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -85,12 +86,19 @@ def journey():
     for s in reserved:s.close()
     processes={};handles=[];history=[];events=[]
     client=Client(config,'oracle',history.append)
+    proxy=CleanupReplyProxy(client,freeport())
+    proxies=[proxy]+[CleanupReplyProxy(client,freeport(),barrier=proxy) for _ in range(2)]
+    controller_config=json.loads(json.dumps(config))
+    for node,forwarder in zip(controller_config['Nodes'][3:6],proxies):
+        node['HTTP']='127.0.0.1:'+str(forwarder.server.server_address[1])
+    controller_path=run/'controller-cluster.json';controller_path.write_text(json.dumps(controller_config))
     def event(name,**data):
         events.append({'event':name,'at':time.monotonic_ns(),**data})
         (run/'events.json').write_text(json.dumps(events,indent=2))
     def start(node):
         log=(run/(node['ID']+'-'+str(time.time_ns())+'.log')).open('wb');handles.append(log)
-        p=subprocess.Popen([str(ROOT/'sharded.exe'),'-config',str(configpath),'-node',node['ID']],stdout=log,stderr=log)
+        path=controller_path if node['Group']=='controller' else configpath
+        p=subprocess.Popen([str(ROOT/'sharded.exe'),'-config',str(path),'-node',node['ID']],stdout=log,stderr=log)
         processes[node['ID']]=p;event('start',node=node['ID'],pid=p.pid)
     def kill(node):
         p=processes[node['ID']];p.kill();p.wait(timeout=10);event('kill',node=node['ID'],pid=p.pid)
@@ -112,8 +120,10 @@ def journey():
     def settled():
         deadline=time.monotonic()+30
         while time.monotonic()<deadline:
-            if client.group('controller','/config',{})['state']['Move'] is None:return
+            state=client.group('controller','/config',{})['state']
+            if state['Move'] is None:return
             time.sleep(.05)
+        event('migration_stalled',state=state)
         raise AssertionError('migration did not finish')
     try:
         for node in config['Nodes']:start(node)
@@ -151,8 +161,32 @@ def journey():
                     victim=leader('controller');kill(victim);event('controller_intermediate_crash',phase=current['Phase']);break
                 time.sleep(.02)
             else:raise AssertionError('did not observe durable intermediate phase')
+            start(victim)
+            assert proxy.committed.wait(timeout=20),'did not intercept committed cleanup response'
+            state=client.group('controller','/config',{})['state']
+            assert state['Move']['Phase']==4,state['Move']
+            client.group('a','/snapshot',{})
+            donor_snapshots=[]
+            for node in config['Nodes']:
+                if node['Group']!='a':continue
+                for path in pathlib.Path(node['Dir']).glob('snapshots/*/state.bin'):
+                    part=json.loads(path.read_text())['Parts'][migration['Shard']]
+                    if part and part['Mode']=='retired' and part['Epoch']+1==migration['Epoch']:
+                        assert part['Values']=={} and part['Clients']=={}
+                        retained=run/('cleanup-donor-'+node['ID']+'-'+path.parent.name+'.json')
+                        retained.write_bytes(path.read_bytes())
+                        donor_snapshots.append(str(retained))
+            assert donor_snapshots,'committed donor retirement missing from durable snapshot'
+            state=client.group('controller','/config',{})['state']
+            assert state['Move']['Phase']==4,state['Move']
+            cleanup_victim=leader('controller')
+            event('cleanup_committed_reply_held',phase=state['Move']['Phase'],observed=proxy.observed,donor_snapshots=donor_snapshots)
+            kill(cleanup_victim)
+            event('controller_crash_after_cleanup_before_phase5',node=cleanup_victim['ID'])
+            proxy.release.set()
             settled();task.result();task2.result();task3.result()
-        start(victim)
+            event('cleanup_retry_recovered')
+        start(cleanup_victim)
         assert dedup.op('append',moving,'D',identity=1)=='seedD'
         final_value=client.op('get',moving)
         assert final_value.startswith('seedD') and final_value[5:].count('W')==12 and final_value[5:].count('Z')==6 and len(final_value)==23
@@ -191,6 +225,7 @@ def journey():
             if p.poll() is None:p.terminate()
         for p in processes.values():p.wait(timeout=10)
         for h in handles:h.close()
+        for forwarder in proxies:forwarder.close()
         event('cleanup',all_owned_processes_stopped=all(p.poll() is not None for p in processes.values()))
     assert (run/'result.json').exists();print(run)
 

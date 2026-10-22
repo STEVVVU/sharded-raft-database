@@ -96,6 +96,45 @@ func TestControllerCAS(t *testing.T) {
 	}
 }
 
+func TestCleanupRetryAfterCommit(t *testing.T) {
+	f := NewFSM("a")
+	if r := apply(f, Command{Op: "freeze", Shard: 0, Epoch: 2}); r.Error != "" {
+		t.Fatal(r)
+	}
+	cleanup := Command{Op: "cleanup", Shard: 0, Epoch: 2}
+	if r := apply(f, cleanup); r.Error != "" {
+		t.Fatal(r)
+	}
+	snap, e := f.Snapshot()
+	if e != nil {
+		t.Fatal(e)
+	}
+	restored := NewFSM("a")
+	if e = restored.Restore(io.NopCloser(strings.NewReader(string(snap.(snapshot))))); e != nil {
+		t.Fatal(e)
+	}
+	for _, state := range []*FSM{f, restored} {
+		if r := apply(state, cleanup); r.Error != "" {
+			t.Fatalf("retry after committed cleanup must succeed, got %q", r.Error)
+		}
+		for _, epoch := range []uint64{1, 3} {
+			if r := apply(state, Command{Op: "cleanup", Shard: 0, Epoch: epoch}); r.Error != "stale cleanup" {
+				t.Fatalf("wrong cleanup epoch %d accepted: %+v", epoch, r)
+			}
+		}
+	}
+	returned := &Shard{2, "frozen", map[string]string{}, map[string]Receipt{}}
+	if r := apply(restored, Command{Op: "install", Shard: 0, Epoch: 3, Part: returned}); r.Error != "" {
+		t.Fatal(r)
+	}
+	if r := apply(restored, Command{Op: "activate", Shard: 0, Epoch: 3}); r.Error != "" {
+		t.Fatal(r)
+	}
+	if r := apply(restored, cleanup); r.Error != "stale cleanup" {
+		t.Fatalf("cleanup after reacquisition accepted: %+v", r)
+	}
+}
+
 func TestBoundsAndIdentity(t *testing.T) {
 	f := NewFSM("a")
 	key := "a"

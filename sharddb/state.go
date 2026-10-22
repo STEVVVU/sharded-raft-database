@@ -187,7 +187,7 @@ func (f *FSM) apply(c Command) Result {
 		if p == nil {
 			return Result{}
 		}
-		if p.Epoch+1 != c.Epoch || p.Mode != "frozen" {
+		if p.Epoch+1 != c.Epoch || (p.Mode != "frozen" && p.Mode != "retired") {
 			return failure("stale cleanup")
 		}
 		// Keep the epoch tombstone to reject delayed installs after a later move.
