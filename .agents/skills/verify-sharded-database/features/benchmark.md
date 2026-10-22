@@ -1,5 +1,7 @@
 # Real-node benchmark with k6
 
+Latest [curated full receipt](../../../../docs/benchmarks/2026-10-22-k6-v2.md): run `39745924574`, source `48318d9`, completes all 126 defined trials including 12,001/12,001 native starts at 100/s for 120 seconds and both fault journeys. Six one-VU matrix negatives retain 11 dropped iterations, so the overall verdict remains false. All exact-value checks/readbacks and cleanup pass; boundary offers, intermediate busy responses, resource/profile gaps and original raw failures remain explicit.
+
 Version 2 completed native smoke and all 125 full-campaign trials in run 39739173112. All trial value checks/readbacks and cleanup passed, while real k6 drops and an overly strict wrapper boundary predicate kept the campaign false. The original receipts remain retained. A narrow accounting correction permits only pinned k6's target-plus-one final timer race while preserving requested and actual native offer counts. Version 1's invalid fixture failure in run 39730696115 also remains retained. No sustained capacity or product limit change is claimed.
 
 The existing launcher, tools/benchmark.py, owns nine actual nodes, task-specific loopback ports/stores and one k6 v2.3.0 subprocess. tools/benchmark-k6.js drives the real HTTP/Raft protocol with native k6 arrival scheduling, dropped iterations, transaction groups and statistics. tools/benchmark_support.py supplies only owned process/resource capture and evidence persistence. The retired custom load/statistics helper has been removed.
