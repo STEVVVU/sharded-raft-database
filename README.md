@@ -1,5 +1,13 @@
 # Sharded Raft key/value database
 
+## Contents
+
+- [Architecture and execution guide](#architecture-and-execution-guide)
+- [Run verification](#run-verification)
+- [Run a persistent cluster](#run-a-persistent-cluster)
+- [HTTP reference](#http-reference)
+- [Bounds and limitations](#bounds-and-limitations)
+
 The [hosted native k6 measurement](docs/benchmarks/2026-10-22-k6-v2.md) completed a 100 transactions/s, 120-second run: all 12,001 native starts finished (12,000 requested plus one framework boundary offer), with zero dropped or failed logical transactions. Started transaction-group p50/p95/p99 was 1.934 / 3.509 / 4.687 ms. At 1,024 bytes, 95% reads and eight VUs, five-repeat p99 had median 5.269 ms (range 3.912–7.369). Six one-VU matrix trials retained 11 drops; both migration and leader-loss journeys passed exact readbacks. Four visible EPYC 9V45 cores, Go 1.27.3 and k6 2.3.0; this fixed offered workload does not establish maximum throughput or intended-arrival latency.
 
 The [version-2 driver](docs/benchmarks/k6-v2-plan.md) is reproducible with `python tools/benchmark.py benchmark` on isolated Linux; `smoke` owns the nine-node cluster and checks exact committed values. Source, environment, full medians/ranges, raw hashes, negative cells and resource limits accompany the results. Earlier invalid fixtures and failed raw verdicts remain preserved. Native hot-path CPU profiling and replication-index telemetry remain unmeasured; shard count remains fixed at four.
@@ -51,6 +59,138 @@ client.op('put', 'hello', 'world')
 client.op('append', 'hello', '!')
 assert client.op('get', 'hello') == 'world!'
 ```
+
+## Architecture and execution guide
+
+This project adds `sharddb` and `cmd/sharded` to the preserved `hraftd` example. HashiCorp Raft provides consensus, TCP transport, Bolt-backed logs, and snapshots. The added state machine supplies four fixed shards, a three-node configuration-controller group, and two three-node data groups.
+
+The boundary map shows the client, controller, data groups, and their independent Raft state.
+
+```mermaid
+flowchart LR
+    client["Retrying HTTP client"] --> api["Node HTTP API"]
+    api --> controller["Controller Raft group"]
+    api --> data["Data Raft groups a and b"]
+    controller -->|"migration commands"| data
+    controller --> disk1["Controller Bolt logs and snapshots"]
+    data --> disk2["Per-node Bolt logs and snapshots"]
+```
+
+Each process serves one HTTP endpoint and participates in one fixed Raft group. The controller stores shard ownership and migration progress. Data-group state machines apply key operations and migration commands. Client operations go to the group that owns the shard at the committed configuration epoch.
+
+This flow follows a key operation and shows how the controller's persisted migration phases recover after a leader change.
+
+```mermaid
+flowchart TD
+    subgraph Client["Client and HTTP boundary"]
+        request["Assign key to fixed shard"] --> config["Read committed owners"]
+        config --> submit["Submit operation with epoch and sequence"]
+    end
+    subgraph Data["Data Raft group"]
+        submit --> leader["Group leader commits FSM operation"]
+        leader --> check["Check owner, epoch, and client receipt"]
+        check --> result["Apply get, put, or append"]
+    end
+    subgraph Migration["Controller recovery loop"]
+        intent["Persist move intent"] --> freeze["Freeze donor"] --> install["Install receiver state"]
+        install --> publish["Commit new owner and epoch"] --> activate["Activate receiver"] --> cleanup["Clean donor tombstone"]
+        cleanup --> done["Clear completed move"]
+    end
+    result -->|"response or retry after timeout"| Client
+```
+
+The client retries bounded HTTP failures against known group members while preserving its sequence. A timed-out operation can have committed, so it remains uncertain until the same client identity and sequence is retried. During a move, the donor freezes before the receiver activates. The persisted phase record lets the controller leader resume; the shard can be temporarily unavailable during this handoff.
+
+| Subsystem | Responsibility | Owned state or invariant | Source |
+| --- | --- | --- | --- |
+| Node lifecycle | Validate fixed membership and open Raft, storage, and HTTP | Nine nodes, three per group, distinct loopback addresses and directories | [`sharddb/node.go`](sharddb/node.go) |
+| Data state machine | Apply key operations and migration actions | Four shards; owner epoch, values, per-client receipts, and freeze mode | [`sharddb/state.go`](sharddb/state.go) |
+| HTTP service | Authenticate and route operations to the local leader | Bearer capability and bounded request slots | [`http/service.go`](http/service.go) |
+| Controller mover | Persist and advance migration phases | One in-flight move and monotonic phase/epoch checks | [`sharddb/node.go`](sharddb/node.go) |
+| Retry client | Refresh configuration and retry leaders | Stable client identity and increasing per-operation sequence | [`tools/client.py`](tools/client.py) |
+
+Terms used in the operation and handoff paths: [Raft](#concept-raft), [state machine](#concept-state-machine), [shard](#concept-shard), [epoch](#concept-epoch), [fencing](#concept-fencing), [migration](#concept-migration), [idempotency](#concept-idempotency), and [linearizability](#concept-linearizability).
+
+<a id="architecture"></a>
+
+### Follow a key operation
+
+1. Start each node with the same fixed configuration and its own persistent directory. An empty directory bootstraps that node's three-member Raft group.
+2. The client maps the key to one of four shards and fetches committed owner information from the controller group.
+3. The client sends the operation, epoch, identity, and sequence to a data-group member. A follower returns HTTP 409; the client tries another member.
+4. The group leader commits the operation through Raft. Its FSM checks epoch and client receipt before changing values or returning a read.
+5. The client records the result. After an uncertain timeout, it retries the same identity and sequence before issuing another operation.
+6. For a move, the controller commits intent, freezes the donor, stages receiver state, publishes ownership, activates the receiver, and cleans the donor. A restarted controller resumes the recorded phase.
+
+### Design decisions and limits
+
+These rationales are inferred from the current implementation. They do not record historic design intent.
+
+| Choice | Practical rationale | Alternative and cost | Reconsider when |
+| --- | --- | --- | --- |
+| Use HashiCorp Raft as the consensus library | The extension needs sharding and recovery behavior while preserving the upstream example | Implementing Raft locally adds another consensus implementation and safety surface | The exercise requires changing consensus internals |
+| Keep three fixed groups and four shards | Small topology makes ownership and migration journeys explicit | Dynamic membership scales topology but needs reconfiguration and discovery | The deployment needs elastic groups or shard counts |
+| Persist migration as numbered phases | A leader can resume work after restart and each step checks epoch | Atomic cross-group transactions need a coordinator protocol with broader coupling | Cross-shard atomicity becomes a requirement |
+| Freeze before receiver activation | Prevents intentional concurrent service from both owners | Overlap improves availability but requires conflict resolution or fencing at every read/write | Temporary unavailability is unacceptable |
+| Retain per-client sequence receipts | Retries suppress repeated effects for the latest sequence per shard | Time-based eviction saves space but can repeat old operations | Client counts exceed the explicit 64-ledger bound |
+
+### Glossary
+
+<a id="concept-raft"></a>
+
+<details><summary>What is Raft?</summary>
+
+Raft is a consensus protocol that orders log entries across a group. This project uses HashiCorp's implementation; a key write is applied by the group's committed state machine.
+</details>
+
+<a id="concept-state-machine"></a>
+
+<details><summary>What is a state machine?</summary>
+
+A state machine applies ordered commands to state and returns results. Here `sharddb.FSM` owns shard maps and accepts only commands with valid epochs.
+</details>
+
+<a id="concept-shard"></a>
+
+<details><summary>What is a shard?</summary>
+
+A shard is a partition of keys assigned to a data group. FNV-1a maps keys into four fixed shards; each shard records its current group and epoch.
+</details>
+
+<a id="concept-epoch"></a>
+
+<details><summary>What is an epoch?</summary>
+
+An epoch is the monotonically increasing ownership version for a shard. A request with an old epoch is rejected after a migration publishes a newer owner.
+</details>
+
+<a id="concept-fencing"></a>
+
+<details><summary>What is fencing?</summary>
+
+Fencing rejects commands from a stale owner or controller. The FSM checks shard epoch and mode before accepting a data or migration command.
+</details>
+
+<a id="concept-migration"></a>
+
+<details><summary>What is shard migration?</summary>
+
+Migration transfers shard values and client receipts between groups while changing the owner epoch. The controller records six phases, from intent through clearing the completed move.
+</details>
+
+<a id="concept-idempotency"></a>
+
+<details><summary>What is idempotency?</summary>
+
+Idempotency means retrying the same identified operation does not apply its effect twice. This implementation remembers the last sequence and fingerprint for each client on each shard, not an unlimited history.
+</details>
+
+<a id="concept-linearizability"></a>
+
+<details><summary>What is linearizability?</summary>
+
+Linearizability means each completed operation appears to take effect at one point between its call and response. Data operations here commit through their group Raft log; `/status` is diagnostic and is not a linearizable read.
+</details>
 
 ## Architecture
 
