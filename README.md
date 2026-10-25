@@ -21,6 +21,266 @@ The complete [hraftd source](https://github.com/otoolep/hraftd) and upstream Git
 
 ## Architecture and execution guide
 
+<!-- execution-flow:start -->
+### Execution flow
+
+Start with the primary path, then expand a detailed workflow. Select a numbered node to see its operation, implementation techniques, and source. Solid arrows show the named control, data, or lifecycle handoff; dotted arrows show error paths. Separate entry points are named in each workflow.
+
+<a id="review-walkthrough"></a>
+
+#### Walk through one concrete example
+
+Send a bounded write for key `cart:42` with a JSON value to its routed shard.
+
+**Trace.** [Choose shard and owner epoch](#flow-step-key-route) → [Authenticate and admit bounded request](#flow-step-http-admit) → [Commit command and apply FSM](#flow-step-raft-apply) → [Fence operation and deduplicate retry](#flow-step-op-receipt) → [Retry owner and bounded group calls](#flow-step-client-retry).
+
+**Result and boundary.** The client routes by key and owner epoch, the bounded request is applied through Raft, and an operation receipt fences or deduplicates a retry. A group request remains bounded and retries can route again if ownership changes.
+
+<details>
+<summary>Implementation decisions to explain</summary>
+
+**Why return an operation receipt before retrying at a new owner?** The receipt lets a retry distinguish a committed operation from a new one, while the owner epoch directs it to current shard ownership. This supports safe retries but does not remove request bounds or guarantee an unavailable owner will respond.
+
+[Sequence receipts and request fingerprints](#technique-sequence-receipts-and-request-fingerprints) · [Epoch fencing](#technique-epoch-fencing).
+
+</details>
+
+#### Primary execution flow
+
+Client operation enters Client.op, obtains controller ownership, routes to a group leader and returns a committed FSM result; migration and persistence are separate controller lifecycle paths.
+
+```mermaid
+flowchart TD
+    n2["2. Choose shard and owner epoch"]
+    click n2 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-key-route" "Open step, techniques, and source" _top
+    n3["3. Authenticate and admit<br/>bounded request"]
+    click n3 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-http-admit" "Open step, techniques, and source" _top
+    n4["4. Commit command and apply FSM"]
+    click n4 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-raft-apply" "Open step, techniques, and source" _top
+    n5["5. Fence operation and<br/>deduplicate retry"]
+    click n5 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-op-receipt" "Open step, techniques, and source" _top
+    n6["6. Retry owner and bounded group<br/>calls"]
+    click n6 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-client-retry" "Open step, techniques, and source" _top
+    n2 -->|"HTTP request to selected group"| n3
+    n3 -->|"authorized leader accepts valid route"| n4
+    n4 -->|"committed log entry"| n5
+    n5 -->|"result or retryable failure"| n6
+    n3 -.->|"HTTP, leader or group failure"| n6
+    n6 -->|"owner operation times out before<br/>overall deadline"| n2
+```
+
+**Detailed workflows.** [Client data operation](#flow-workflow-client-data-operation) · [Migration lifecycle](#flow-workflow-migration-lifecycle) · [Raft durability and restart](#flow-workflow-durability-recovery).
+
+<a id="flow-workflow-client-data-operation"></a>
+
+<details>
+<summary>Client data operation</summary>
+
+Python client routes by key shard using controller state and retries until deadline; a timeout is reported as indeterminate and preserves request sequence for safe retry.
+
+```mermaid
+flowchart TD
+    n2["2. Choose shard and owner epoch"]
+    click n2 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-key-route" "Open step, techniques, and source" _top
+    n3["3. Authenticate and admit<br/>bounded request"]
+    click n3 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-http-admit" "Open step, techniques, and source" _top
+    n4["4. Commit command and apply FSM"]
+    click n4 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-raft-apply" "Open step, techniques, and source" _top
+    n5["5. Fence operation and<br/>deduplicate retry"]
+    click n5 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-op-receipt" "Open step, techniques, and source" _top
+    n6["6. Retry owner and bounded group<br/>calls"]
+    click n6 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-client-retry" "Open step, techniques, and source" _top
+    n2 -->|"owner group /op"| n3
+    n3 -->|"accepted command"| n4
+    n4 -->|"Raft commit"| n5
+    n5 -->|"response or retry"| n6
+    n3 -.->|"HTTP, leader or group failure"| n6
+    n6 -->|"owner operation times out before<br/>overall deadline"| n2
+```
+
+</details>
+
+<a id="flow-workflow-migration-lifecycle"></a>
+
+<details>
+<summary>Migration lifecycle</summary>
+
+Controller leader ticker advances a persisted migration through freeze, transfer, publish, activate, retire and cleanup; failed group RPC leaves phase unchanged for a later tick.
+
+```mermaid
+flowchart TD
+    n7["7. Start validated migration"]
+    click n7 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-migration-begin" "Open step, techniques, and source" _top
+    n8["8. Freeze, transfer and stage<br/>shard"]
+    click n8 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-migration-transfer" "Open step, techniques, and source" _top
+    n9["9. Publish owner then activate"]
+    click n9 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-migration-publish" "Open step, techniques, and source" _top
+    n10["10. Retire donor and clear<br/>migration"]
+    click n10 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-migration-retire" "Open step, techniques, and source" _top
+    n7 -->|"leader ticker observes phase 0/1"| n8
+    n8 -->|"transfer succeeds and phase commits"| n9
+    n9 -->|"activation succeeds then subsequent<br/>phase ticks"| n10
+```
+
+</details>
+
+<a id="flow-workflow-durability-recovery"></a>
+
+<details>
+<summary>Raft durability and restart</summary>
+
+Each node opens persistent Bolt log and snapshot storage; FSM snapshots and restores state through Raft callbacks.
+
+```mermaid
+flowchart TD
+    n1["1. Load config and open node"]
+    click n1 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-start-node" "Open step, techniques, and source" _top
+    n11["11. Persist and restore Raft<br/>state"]
+    click n11 href "https://github.com/STEVVVU/sharded-raft-database#flow-step-snapshot-recovery" "Open step, techniques, and source" _top
+    n1 -->|"Raft invokes snapshot/restore<br/>callbacks"| n11
+```
+
+</details>
+
+#### Steps, techniques, and source
+
+These source traces cover the active scope below. They explain implementation behavior; benchmark results and their limits remain in the measurement sections.
+
+<a id="flow-step-start-node"></a>
+
+##### 1. Load config and open node
+
+**Component.** cmd/sharded.main / sharddb.Open. The executable reads and decodes config, then Open validates node counts, groups, distinct loopback endpoints/directories and token bounds. It opens per-node Bolt log storage, file snapshots and TCP transport, detects existing state, starts Raft and bootstraps only a fresh group; then starts bounded HTTP serving and controller leader ticker.
+
+**Techniques at this step.** [Raft log and snapshot recovery](#technique-raft-log-and-snapshot-recovery) · [Authenticated bounded request handling](#technique-authenticated-bounded-request-handling).
+
+**Source.** [`cmd/sharded/main.go:13`](https://github.com/STEVVVU/sharded-raft-database/blob/master/cmd/sharded/main.go#L13) · [`sharddb/node.go:38`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L38) · [`sharddb/node.go:74`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L74). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-key-route"></a>
+
+##### 2. Choose shard and owner epoch
+
+**Component.** tools/client.py.Client.op / shard. Client hashes UTF-8 key bytes with FNV-1a modulo four, reads controller /config and selects that shard's owner group and epoch for the command.
+
+**Techniques at this step.** [Fixed hash sharding](#technique-fixed-hash-sharding) · [Bounded leader and epoch retry](#technique-bounded-leader-and-epoch-retry).
+
+**Source.** [`tools/client.py:4`](https://github.com/STEVVVU/sharded-raft-database/blob/master/tools/client.py#L4) · [`tools/client.py:33`](https://github.com/STEVVVU/sharded-raft-database/blob/master/tools/client.py#L33) · [`sharddb/state.go:67`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L67). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-http-admit"></a>
+
+##### 3. Authenticate and admit bounded request
+
+**Component.** sharddb.Node.handle. Constant-time bearer comparison precedes admission to a 16-slot channel; excess requests get 429. Method, leader status, body size, unknown fields and trailing data are checked before route dispatch; errors return HTTP status codes.
+
+**Techniques at this step.** [Authenticated bounded request handling](#technique-authenticated-bounded-request-handling).
+
+**Source.** [`sharddb/node.go:195`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L195). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-raft-apply"></a>
+
+##### 4. Commit command and apply FSM
+
+**Component.** sharddb.Node.apply / FSM.Apply. The leader JSON-encodes the command and submits it with a two-second Raft apply timeout. Committed log entries decode under FSM mutex and dispatch to controller or group-local state; apply/future errors are returned.
+
+**Techniques at this step.** [Committed state-machine operations](#technique-committed-state-machine-operations).
+
+**Source.** [`sharddb/node.go:184`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L184) · [`sharddb/state.go:93`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L93). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-op-receipt"></a>
+
+##### 5. Fence operation and deduplicate retry
+
+**Component.** FSM.apply. Data operations require the local shard to be serving at the supplied epoch and key hash to match. Input bounds and client sequence are checked; SHA-256 fingerprints bind operation/key/value, same-sequence matching requests return the stored receipt, conflicts and stale sequences fail, and successful get/put/append records a receipt.
+
+**Techniques at this step.** [Committed state-machine operations](#technique-committed-state-machine-operations) · [Epoch fencing](#technique-epoch-fencing) · [Sequence receipts and request fingerprints](#technique-sequence-receipts-and-request-fingerprints).
+
+**Source.** [`sharddb/state.go:102`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L102). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-client-retry"></a>
+
+##### 6. Retry owner and bounded group calls
+
+**Component.** Client.group / Client.op. Group calls cycle configured nodes matching the group until deadline, catching transport, decode and server errors with 50ms delay. Operation retries refresh controller ownership and epoch, cap each owner attempt at four seconds, and on deadline records an indeterminate result and asks caller to retry the same identity/sequence.
+
+**Techniques at this step.** [Bounded leader and epoch retry](#technique-bounded-leader-and-epoch-retry).
+
+**Source.** [`tools/client.py:19`](https://github.com/STEVVVU/sharded-raft-database/blob/master/tools/client.py#L19) · [`tools/client.py:33`](https://github.com/STEVVVU/sharded-raft-database/blob/master/tools/client.py#L33). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-migration-begin"></a>
+
+##### 7. Start validated migration
+
+**Component.** controller FSM.apply. A begin command rejects malformed moves, concurrent different migrations and stale owner/epoch/phase; an exact duplicate is idempotent. Controller stores the migration at phase zero.
+
+**Techniques at this step.** [Recoverable phased shard migration](#technique-recoverable-phased-shard-migration) · [Epoch fencing](#technique-epoch-fencing).
+
+**Source.** [`sharddb/state.go:102`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L102). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-migration-transfer"></a>
+
+##### 8. Freeze, transfer and stage shard
+
+**Component.** Node.step / group FSM.apply. Leader ticker reads controller state. Phase 0 freezes donor; phase 1 re-reads frozen donor partition and installs it at destination after validating transfer contents and epoch, marking the copy staged. RPC scans group peers and skips transport, status or decode failures; phase advances only when required calls succeed.
+
+**Techniques at this step.** [Recoverable phased shard migration](#technique-recoverable-phased-shard-migration) · [Epoch fencing](#technique-epoch-fencing).
+
+**Source.** [`sharddb/node.go:282`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L282) · [`sharddb/node.go:256`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L256) · [`sharddb/state.go:156`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L156) · [`sharddb/state.go:241`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L241). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-migration-publish"></a>
+
+##### 9. Publish owner then activate
+
+**Component.** controller FSM.apply / Node.step. After transfer phase, phase 3 changes controller owner to destination at the new epoch; the next phase activates staged destination. Phase updates must be sequential; duplicate current phase is idempotent and stale/conflicting updates fail.
+
+**Techniques at this step.** [Recoverable phased shard migration](#technique-recoverable-phased-shard-migration) · [Epoch fencing](#technique-epoch-fencing).
+
+**Source.** [`sharddb/state.go:126`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L126) · [`sharddb/node.go:282`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L282). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-migration-retire"></a>
+
+##### 10. Retire donor and clear migration
+
+**Component.** Node.step / group and controller FSM.apply. Later phases clean donor data while retaining a retired epoch tombstone, then clear controller migration. Failed RPCs leave the current phase for a later ticker attempt; invalid phases fail.
+
+**Techniques at this step.** [Recoverable phased shard migration](#technique-recoverable-phased-shard-migration) · [Epoch fencing](#technique-epoch-fencing).
+
+**Source.** [`sharddb/node.go:282`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L282) · [`sharddb/state.go:180`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L180). [Back to execution flow](#execution-flow).
+
+<a id="flow-step-snapshot-recovery"></a>
+
+##### 11. Persist and restore Raft state
+
+**Component.** FSM.Snapshot / Restore and sharddb.Open. FSM snapshots JSON state under mutex; Persist writes to Raft snapshot sink and cancels on write error. Restore decodes at most 16 MiB and replaces state under mutex. Open checks existing Bolt log/snapshot state so bootstrap only occurs on a fresh group.
+
+**Techniques at this step.** [Raft log and snapshot recovery](#technique-raft-log-and-snapshot-recovery).
+
+**Source.** [`sharddb/state.go:260`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L260) · [`sharddb/state.go:274`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/state.go#L274) · [`sharddb/node.go:74`](https://github.com/STEVVVU/sharded-raft-database/blob/master/sharddb/node.go#L74). [Back to execution flow](#execution-flow).
+
+<details>
+<summary>Scope and subsystem coverage</summary>
+
+Active cmd/sharded startup, sharddb node and FSM paths, directly used Raft and raft-boltdb persistence, and tools/client.py retries. Excludes inactive inherited HTTP implementation.
+
+- **Fixed key partitioning.** Client and FSM independently calculate the fixed four-way hash. [Step 2](#flow-step-key-route), [Step 5](#flow-step-op-receipt).
+- **Committed data operations and epochs.** Committed commands apply under FSM serialization; data ownership checks enforce epochs. [Step 4](#flow-step-raft-apply), [Step 5](#flow-step-op-receipt), [Step 9](#flow-step-migration-publish).
+- **Migration.** Controller phases sequence transfer, publication, activation and donor retirement. [Step 7](#flow-step-migration-begin), [Step 8](#flow-step-migration-transfer), [Step 9](#flow-step-migration-publish), [Step 10](#flow-step-migration-retire).
+- **Durability and recovery.** Bolt-backed Raft log and file snapshots are opened with FSM snapshot/restore callbacks. [Step 1](#flow-step-start-node), [Step 11](#flow-step-snapshot-recovery).
+- **Client retries.** Client refreshes owner/epoch and FSM receipts make same-sequence replay idempotent. [Step 2](#flow-step-key-route), [Step 6](#flow-step-client-retry), [Step 5](#flow-step-op-receipt).
+- **HTTP boundary.** HTTP serving starts with bounded headers/timeouts; handler checks token, admission, body and leader. [Step 1](#flow-step-start-node), [Step 3](#flow-step-http-admit).
+
+Outside this flow audit:
+
+- `main.go, http/, store/`. Inherited upstream executable and API are outside active cmd/sharded and sharddb implementation.
+- `sharddb/state_test.go and tools/verify.py`. Verification-only code is not production flow.
+- `http/service.go`. Inactive original HTTP service is excluded from active routes.
+
+</details>
+
+<!-- execution-flow:end -->
+
+<details>
+<summary>Subsystem technique index</summary>
+
 ### Subsystem map
 
 Select a subsystem in the diagram to open its techniques, tradeoffs, and code references. The numbered links provide the same navigation. This map groups components; the execution diagrams show their runtime flow.
@@ -52,6 +312,8 @@ flowchart LR
 This project adds `sharddb` and `cmd/sharded` to the preserved `hraftd` example. HashiCorp Raft provides consensus, TCP transport, Bolt-backed logs, and snapshots. The added state machine supplies four fixed shards, a three-node configuration-controller group, and two three-node data groups.
 
 The boundary map shows the client, controller, data groups, and their independent Raft state.
+
+</details>
 
 <details>
 <summary>Expand flow diagram 1</summary>
