@@ -3,6 +3,7 @@
 ## Contents
 
 - [Architecture and execution guide](#architecture-and-execution-guide)
+- [Implementation techniques](#implementation-techniques)
 - [Run verification](#run-verification)
 - [Run a persistent cluster](#run-a-persistent-cluster)
 - [HTTP reference](#http-reference)
@@ -108,6 +109,155 @@ The client retries bounded HTTP failures against known group members while prese
 | HTTP service | Authenticate and route operations to the local leader | Bearer capability and bounded request slots | [`http/service.go`](http/service.go) |
 | Controller mover | Persist and advance migration phases | One in-flight move and monotonic phase/epoch checks | [`sharddb/node.go`](sharddb/node.go) |
 | Retry client | Refresh configuration and retry leaders | Stable client identity and increasing per-operation sequence | [`tools/client.py`](tools/client.py) |
+
+## Implementation techniques
+
+The cards cover the active `cmd/sharded` and `sharddb` paths, their direct HashiCorp Raft integration, and the retry methods in `tools/client.py`. Rationale is inferred from the current code. The original `hraftd` API and retained examples are outside this section.
+
+| Subsystem | Technique cards | Source files |
+| --- | --- | --- |
+| Fixed key partitioning | [Fixed hash sharding](#technique-fixed-hash-sharding) | [`sharddb/state.go`](sharddb/state.go), [`tools/client.py`](tools/client.py) |
+| Committed data operations and epochs | [Committed state-machine operations](#technique-committed-state-machine-operations), [Epoch fencing](#technique-epoch-fencing) | [`sharddb/node.go`](sharddb/node.go), [`sharddb/state.go`](sharddb/state.go) |
+| Migration | [Recoverable phased shard migration](#technique-recoverable-phased-shard-migration) | [`sharddb/node.go`](sharddb/node.go), [`sharddb/state.go`](sharddb/state.go) |
+| Durability and recovery | [Raft log and snapshot recovery](#technique-raft-log-and-snapshot-recovery) | [`sharddb/node.go`](sharddb/node.go), [`sharddb/state.go`](sharddb/state.go) |
+| Client retries | [Sequence receipts and request fingerprints](#technique-sequence-receipts-and-request-fingerprints), [Bounded leader and epoch retry](#technique-bounded-leader-and-epoch-retry) | [`sharddb/state.go`](sharddb/state.go), [`tools/client.py`](tools/client.py) |
+| HTTP boundary | [Authenticated bounded request handling](#technique-authenticated-bounded-request-handling) | [`sharddb/node.go`](sharddb/node.go) |
+
+<a id="technique-fixed-hash-sharding"></a>
+
+<details>
+<summary>Fixed hash sharding</summary>
+
+**Mechanism.** `KeyShard` applies 32-bit FNV-1a to the UTF-8 bytes of a key, then takes the remainder modulo four. The Python retry client uses the same constants and arithmetic. The resulting shard number selects the committed owner entry and the data-group command target.
+
+**Example.** For a key whose hash remainder is `2`, both the client and FSM route it to shard 2, initially owned by group `a`.
+
+**Why here.** A fixed mapping lets the controller move ownership without changing which shard contains a key.
+
+**Tradeoffs.** Changing the hash or shard count would remap keys and requires a data migration. The mapping does not promise balanced key counts.
+
+**Code and ownership.** [`KeyShard`](sharddb/state.go#L67) is extension code. [`shard`](tools/client.py#L4) duplicates the mapping at the client boundary.
+
+</details>
+
+<a id="technique-committed-state-machine-operations"></a>
+
+<details>
+<summary>Committed state-machine operations</summary>
+
+**Mechanism.** The node serializes each command and submits it with `Raft.Apply`; the FSM changes state only when Raft applies the log entry. Get, Put, Append, and controller configuration queries use this route. The mutex protects the FSM state while applying a committed entry and while making a snapshot copy.
+
+**Example.** A Get is encoded as a command and submitted through the group log, so the handler does not return a follower's local map value.
+
+**Why here.** Routing reads through the log gives reads the same group ordering as writes and migration changes.
+
+**Tradeoffs.** Reads need a leader and quorum. This costs availability and log work compared with a local or lease-based read.
+
+**Code and ownership.** [`Node.apply`](sharddb/node.go#L184) and [`FSM.Apply`](sharddb/state.go#L93) are extension code using inherited HashiCorp Raft ordering.
+
+</details>
+
+<a id="technique-epoch-fencing"></a>
+
+<details>
+<summary>Epoch fencing</summary>
+
+**Mechanism.** Each shard carries an owner group and monotonically increasing epoch. Data commands must match the local shard epoch and serving mode. Controller begin and phase commands also compare the expected owner, next epoch, shard, and current phase before advancing.
+
+**Example.** After ownership advances from epoch 1 to 2, an operation carrying epoch 1 fails the FSM's owner check even if it reaches the former group.
+
+**Why here.** Epoch checks reject delayed requests and stale migration actions after leadership changes or retries.
+
+**Tradeoffs.** Epochs prevent stale commands from taking effect, but do not keep a shard available while neither copy is serving. This is not a cross-group atomic transaction.
+
+**Code and ownership.** [`FSM.apply`](sharddb/state.go#L102) enforces data and controller checks; [`Node.step`](sharddb/node.go#L282) supplies phase transitions. Extension code.
+
+</details>
+
+<a id="technique-recoverable-phased-shard-migration"></a>
+
+<details>
+<summary>Recoverable phased shard migration</summary>
+
+**Mechanism.** The controller commits a move intent, freezes the donor through its Raft group, installs the frozen values and receipts as staged receiver state, publishes the new owner and epoch, activates the receiver, retires the donor, then clears the move record. The phase is durable controller state. Repeating a phase action is accepted where safe, so a new leader can continue after a lost response.
+
+**Example.** At phase 1, the controller asks the donor to freeze and return a copy, then sends that copy to the receiver's install command.
+
+**Why here.** Explicit durable steps allow recovery without a distributed transaction spanning the three Raft groups.
+
+**Tradeoffs.** Freezing before activation can make the shard unavailable during the handoff. Both groups and the controller need quorums to complete it.
+
+**Code and ownership.** [`Node.step`](sharddb/node.go#L282) coordinates phases; [`FSM.apply`](sharddb/state.go#L102) validates and persists transitions. Extension code.
+
+</details>
+
+<a id="technique-raft-log-and-snapshot-recovery"></a>
+
+<details>
+<summary>Raft log and snapshot recovery</summary>
+
+**Mechanism.** Each node opens its own Bolt-backed Raft log and stable store plus a file snapshot store retaining two snapshots. Existing state determines whether to bootstrap the fixed group. The FSM snapshots its state as JSON; Raft's snapshot sink persists the bytes, and restore decodes at most 16 MiB into FSM state.
+
+**Example.** On restart, `Open` checks `HasExistingState` before calling `BootstrapCluster`, allowing persisted Raft state to recover rather than re-bootstrap.
+
+**Why here.** Durable logs and snapshots let each independent process recover its replicated state after restart.
+
+**Tradeoffs.** Snapshots serialize the complete FSM state and the restore limit bounds accepted data. HashiCorp Raft and raft-boltdb implement the underlying replication and storage mechanisms; this project configures and supplies the FSM hooks.
+
+**Code and ownership.** [`Open`](sharddb/node.go#L74), [`FSM.Snapshot`](sharddb/state.go#L260), and [`FSM.Restore`](sharddb/state.go#L274). Integration is inherited/dependency; snapshot representation is extension code.
+
+</details>
+
+<a id="technique-sequence-receipts-and-request-fingerprints"></a>
+
+<details>
+<summary>Sequence receipts and request fingerprints</summary>
+
+**Mechanism.** For each client on each shard, the FSM retains the latest sequence, a SHA-256 fingerprint of operation, key, and value, and the prior result. A matching sequence and fingerprint returns the saved result without applying the effect again. A lower sequence or same sequence with different inputs is rejected. Migration and snapshots carry the receipt ledger with shard values.
+
+**Example.** If an Append commits but its HTTP reply is lost, retrying the same identity and sequence returns its stored value instead of appending again.
+
+**Why here.** Receipts resolve uncertain client outcomes across leader retries and shard moves.
+
+**Tradeoffs.** The ledger stores only the latest sequence per client per shard and is capped at 64 clients per shard. This does not guarantee exactly-once external side effects.
+
+**Code and ownership.** [`Receipt`](sharddb/state.go#L19), the operation branch in [`FSM.apply`](sharddb/state.go#L102), and [`validPart`](sharddb/state.go#L241). Extension code.
+
+</details>
+
+<a id="technique-bounded-leader-and-epoch-retry"></a>
+
+<details>
+<summary>Bounded leader and epoch retry</summary>
+
+**Mechanism.** The Python client scans configured members of a group until a monotonic deadline, retaining the latest transport or response error and pausing briefly between scans. For each operation it refreshes committed controller configuration, attaches the current epoch, and retries through the current owner group with a shorter per-attempt deadline. It preserves the same sequence when the result remains uncertain.
+
+**Example.** A leadership change causes the client to try another configured group member, then fetch ownership again before retrying the operation.
+
+**Why here.** Fixed membership makes a bounded member scan sufficient for this teaching cluster.
+
+**Tradeoffs.** Retries can return a timeout with an indeterminate operation outcome. The caller must reuse the same identity and sequence; the client does not retry indefinitely.
+
+**Code and ownership.** [`Client.group`](tools/client.py#L19) and [`Client.op`](tools/client.py#L33). Extension code.
+
+</details>
+
+<a id="technique-authenticated-bounded-request-handling"></a>
+
+<details>
+<summary>Authenticated bounded request handling</summary>
+
+**Mechanism.** The handler compares the bearer capability in constant time, admits at most 16 concurrent requests through a buffered channel, caps request bodies at 4 MiB, rejects unknown JSON fields and trailing data, and requires POST for mutating routes. The HTTP server also sets header, read, write, idle, and header-size limits.
+
+**Example.** A seventeenth simultaneous request receives HTTP 429 without entering route processing.
+
+**Why here.** These checks bound resource use and protect the single-tenant administrative HTTP boundary.
+
+**Tradeoffs.** The capability is shared cluster-wide, and Raft TCP trusts local processes. The boundary is not intended for hostile multi-tenant deployment.
+
+**Code and ownership.** [`Node.handle`](sharddb/node.go#L195) and HTTP server setup in [`Open`](sharddb/node.go#L141). Extension code using Go's HTTP and constant-time comparison facilities.
+
+</details>
 
 Terms used in the operation and handoff paths: [Raft](#concept-raft), [state machine](#concept-state-machine), [shard](#concept-shard), [epoch](#concept-epoch), [fencing](#concept-fencing), [migration](#concept-migration), [idempotency](#concept-idempotency), and [linearizability](#concept-linearizability).
 
